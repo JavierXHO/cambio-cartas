@@ -31,10 +31,16 @@ app.post("/api/scan", async (req, res) => {
           content: [
             {
               type: "text",
-              text:
-                "En esta foto hay cartas Pokemon (binder). Devuelve SOLO JSON valido, SIN markdown y SIN ```.\n" +
-                "Formato exacto: {\"cards\":[{\"name\":\"\"}]}.\n" +
-                "Incluye solo nombres. Si dudas, pon el nombre mas probable."
+          text:
+"En esta foto hay un binder con 9 cartas Pokémon.\n" +
+"Devuelve SOLO JSON válido, SIN markdown y SIN ```.\n" +
+"Formato exacto:\n" +
+"{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
+"Reglas:\n" +
+"- confidence entre 0.0 y 1.0\n" +
+"- set: nombre del set/expansión si se puede inferir, si no pon \"\"\n" +
+"- collector_number: el número de colección si se ve (ej: \"12/108\" o \"12\"), si no pon \"\"\n" +
+"- Si una carta se repite, inclúyela igual.\n"
             },
             {
               type: "image_url",
@@ -93,3 +99,4 @@ app.post("/api/scan", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("API running on port", port));
+
