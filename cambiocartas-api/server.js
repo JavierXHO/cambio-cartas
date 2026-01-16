@@ -21,7 +21,7 @@ function safeNumber(x) {
 }
 
 async function tcgdexSearchByName(name) {
-  const url = `${TCGDEX_BASE}/cards?name=${encodeURIComponent(name)}`; // filtro por nombre (laxist/eq disponibles)
+  const url = `${TCGDEX_BASE}/cards?name=${encodeURIComponent(name)}`;
   const r = await fetch(url);
   if (!r.ok) return [];
   const data = await r.json();
@@ -42,12 +42,10 @@ function pickBestCandidate(candidates, localIdWanted) {
     const exact = candidates.find(c => String(c.localId) === String(localIdWanted));
     if (exact) return exact;
 
-    // a veces localId puede traer letras (XY95). intentamos "startsWith"
     const starts = candidates.find(c => String(c.localId).startsWith(String(localIdWanted)));
     if (starts) return starts;
   }
 
-  // si no hay número, tomamos el primero (TCGdex ya ordena bastante bien para nombre exacto)
   return candidates[0];
 }
 
@@ -56,7 +54,6 @@ function extractPricesFromTcgdexCard(fullCard) {
   const tcg = pricing?.tcgplayer || null;
   const cm = pricing?.cardmarket || null;
 
-  // Preferencia: TCGplayer normal.marketPrice
   const usd =
     safeNumber(tcg?.normal?.marketPrice) ??
     safeNumber(tcg?.holofoil?.marketPrice) ??
@@ -66,7 +63,6 @@ function extractPricesFromTcgdexCard(fullCard) {
     safeNumber(tcg?.["reverse-holofoil"]?.midPrice) ??
     null;
 
-  // Cardmarket: trend (no-foil) o trend-holo (foil)
   const eur =
     safeNumber(cm?.trend) ??
     safeNumber(cm?.["trend-holo"]) ??
@@ -74,10 +70,24 @@ function extractPricesFromTcgdexCard(fullCard) {
     safeNumber(cm?.["avg-holo"]) ??
     null;
 
-  return {
-    price_usd: usd,
-    price_eur: eur
-  };
+  return { price_usd: usd, price_eur: eur };
+}
+
+function extractImageUrlFromTcgdexCard(fullCard) {
+  // TCGdex suele entregar "image" como objeto con tamaños o como string
+  // Probamos varias opciones y devolvemos la primera que exista
+  const img = fullCard?.image;
+  if (!img) return null;
+
+  if (typeof img === "string") return img;
+
+  return (
+    img.large ||
+    img.high ||
+    img.small ||
+    img.low ||
+    null
+  );
 }
 
 app.post("/api/scan", async (req, res) => {
@@ -88,7 +98,7 @@ app.post("/api/scan", async (req, res) => {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
 
-    // 1) Vision: detectar cartas
+    // 1) OpenAI Vision: detectar cartas (solo metadata)
     const payload = {
       model: "gpt-4o-mini",
       messages: [
@@ -105,7 +115,8 @@ app.post("/api/scan", async (req, res) => {
                 "Reglas:\n" +
                 "- confidence entre 0.0 y 1.0\n" +
                 "- set: nombre del set/expansión si se puede inferir, si no \"\"\n" +
-                "- collector_number: número visible, si no \"\"\n"
+                "- collector_number: número visible (ej: \"12/108\" o \"12\"), si no \"\"\n" +
+                "- Si una carta se repite, inclúyela igual.\n"
             },
             {
               type: "image_url",
@@ -136,28 +147,26 @@ app.post("/api/scan", async (req, res) => {
     let cards = [];
     if (parsed && Array.isArray(parsed.cards)) {
       cards = parsed.cards.map((c) => ({
-        name: (c?.name || "").toString().trim(),
-        set: (c?.set || "").toString().trim(),
-        collector_number: (c?.collector_number || "").toString().trim(),
+        name: (c?.name || "").toString().trim().replace(/[`"]/g, ""),
+        set: (c?.set || "").toString().trim().replace(/[`"]/g, ""),
+        collector_number: (c?.collector_number || "").toString().trim().replace(/[`"]/g, ""),
         confidence: Math.max(0, Math.min(1, Number(c?.confidence ?? 0)))
       }));
     }
 
     cards = cards.filter(c => c.name);
 
-    // 2) Enriquecer con TCGdex (precio)
+    // 2) Enriquecer con TCGdex: imagen + precios
     const enriched = [];
 
     for (const c of cards) {
       const localIdWanted = normalizeCollectorNumber(c.collector_number);
 
-      // Buscar candidatos por nombre
       const candidates = await tcgdexSearchByName(c.name);
-
-      // Elegir mejor candidato por número si existe
       const best = pickBestCandidate(candidates, localIdWanted);
 
       let tcgdex_id = null;
+      let image_url = null;
       let price_usd = null;
       let price_eur = null;
 
@@ -169,12 +178,15 @@ app.post("/api/scan", async (req, res) => {
           const prices = extractPricesFromTcgdexCard(full);
           price_usd = prices.price_usd;
           price_eur = prices.price_eur;
+
+          image_url = extractImageUrlFromTcgdexCard(full);
         }
       }
 
       enriched.push({
         ...c,
         tcgdex_id,
+        image_url,
         price_usd,
         price_eur
       });
