@@ -31,16 +31,16 @@ app.post("/api/scan", async (req, res) => {
           content: [
             {
               type: "text",
-          text:
-"En esta foto hay un binder con 9 cartas Pokémon.\n" +
-"Devuelve SOLO JSON válido, SIN markdown y SIN ```.\n" +
-"Formato exacto:\n" +
-"{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
-"Reglas:\n" +
-"- confidence entre 0.0 y 1.0\n" +
-"- set: nombre del set/expansión si se puede inferir, si no pon \"\"\n" +
-"- collector_number: el número de colección si se ve (ej: \"12/108\" o \"12\"), si no pon \"\"\n" +
-"- Si una carta se repite, inclúyela igual.\n"
+              text:
+                "En esta foto hay un binder con 9 cartas Pokémon.\n" +
+                "Devuelve SOLO JSON válido, SIN markdown y SIN ```.\n" +
+                "Formato exacto:\n" +
+                "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
+                "Reglas:\n" +
+                "- confidence entre 0.0 y 1.0\n" +
+                "- set: nombre del set/expansión si se puede inferir, si no pon \"\"\n" +
+                "- collector_number: el número de colección si se ve (ej: \"12/108\" o \"12\"), si no pon \"\"\n" +
+                "- Si una carta se repite, inclúyela igual.\n"
             },
             {
               type: "image_url",
@@ -64,6 +64,7 @@ app.post("/api/scan", async (req, res) => {
 
     const data = await r.json();
 
+    // ----- Parsear y normalizar salida -----
     let text = data?.choices?.[0]?.message?.content ?? "";
     text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
 
@@ -74,24 +75,41 @@ app.post("/api/scan", async (req, res) => {
       parsed = null;
     }
 
-    let names = [];
+    let cards = [];
 
     if (parsed && Array.isArray(parsed.cards)) {
-      names = parsed.cards.map((c) => (typeof c === "string" ? c : c?.name || ""));
+      cards = parsed.cards.map((c) => ({
+        name: (c?.name || "").toString().trim(),
+        set: (c?.set || "").toString().trim(),
+        collector_number: (c?.collector_number || "").toString().trim(),
+        confidence: Number(c?.confidence ?? 0)
+      }));
     } else {
-      names = text
+      // fallback: si algo sale mal, devuelvo solo nombres
+      const lines = text
         .split("\n")
         .map((s) => s.replace(/^[-•\d.]+\s*/, "").trim())
         .filter(Boolean);
+
+      cards = lines.map((name) => ({
+        name,
+        set: "",
+        collector_number: "",
+        confidence: 0.3
+      }));
     }
 
-    names = names
-      .map((n) => n.replace(/[`"]/g, "").trim())
-      .filter(Boolean);
+    // limpieza final
+    cards = cards
+      .filter((c) => c.name)
+      .map((c) => ({
+        name: c.name.replace(/[`"]/g, "").trim(),
+        set: c.set.replace(/[`"]/g, "").trim(),
+        collector_number: c.collector_number.replace(/[`"]/g, "").trim(),
+        confidence: Math.max(0, Math.min(1, isNaN(c.confidence) ? 0 : c.confidence))
+      }));
 
-    const unique = [...new Set(names)];
-
-    return res.json({ cards: unique.map((name) => ({ name })) });
+    return res.json({ cards });
   } catch (e) {
     return res.status(500).json({ error: "Fallo al analizar imagen" });
   }
@@ -99,4 +117,3 @@ app.post("/api/scan", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("API running on port", port));
-
