@@ -2,27 +2,93 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "12mb" }));
 
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
-});
+const TCGDEX_BASE = "https://api.tcgdex.net/v2/en";
+
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+function normalizeCollectorNumber(s) {
+  if (!s) return "";
+  // "12/108" -> "12"
+  return String(s).split("/")[0].trim();
+}
+
+function safeNumber(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function tcgdexSearchByName(name) {
+  const url = `${TCGDEX_BASE}/cards?name=${encodeURIComponent(name)}`; // filtro por nombre (laxist/eq disponibles)
+  const r = await fetch(url);
+  if (!r.ok) return [];
+  const data = await r.json();
+  return Array.isArray(data) ? data : [];
+}
+
+async function tcgdexGetCardById(id) {
+  const url = `${TCGDEX_BASE}/cards/${encodeURIComponent(id)}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+function pickBestCandidate(candidates, localIdWanted) {
+  if (!candidates.length) return null;
+
+  if (localIdWanted) {
+    const exact = candidates.find(c => String(c.localId) === String(localIdWanted));
+    if (exact) return exact;
+
+    // a veces localId puede traer letras (XY95). intentamos "startsWith"
+    const starts = candidates.find(c => String(c.localId).startsWith(String(localIdWanted)));
+    if (starts) return starts;
+  }
+
+  // si no hay número, tomamos el primero (TCGdex ya ordena bastante bien para nombre exacto)
+  return candidates[0];
+}
+
+function extractPricesFromTcgdexCard(fullCard) {
+  const pricing = fullCard?.pricing || {};
+  const tcg = pricing?.tcgplayer || null;
+  const cm = pricing?.cardmarket || null;
+
+  // Preferencia: TCGplayer normal.marketPrice
+  const usd =
+    safeNumber(tcg?.normal?.marketPrice) ??
+    safeNumber(tcg?.holofoil?.marketPrice) ??
+    safeNumber(tcg?.["reverse-holofoil"]?.marketPrice) ??
+    safeNumber(tcg?.normal?.midPrice) ??
+    safeNumber(tcg?.holofoil?.midPrice) ??
+    safeNumber(tcg?.["reverse-holofoil"]?.midPrice) ??
+    null;
+
+  // Cardmarket: trend (no-foil) o trend-holo (foil)
+  const eur =
+    safeNumber(cm?.trend) ??
+    safeNumber(cm?.["trend-holo"]) ??
+    safeNumber(cm?.avg) ??
+    safeNumber(cm?.["avg-holo"]) ??
+    null;
+
+  return {
+    price_usd: usd,
+    price_eur: eur
+  };
+}
 
 app.post("/api/scan", async (req, res) => {
   try {
     const { imageBase64 } = req.body;
-
-    if (!imageBase64) {
-      return res.status(400).json({ error: "Falta imageBase64" });
-    }
+    if (!imageBase64) return res.status(400).json({ error: "Falta imageBase64" });
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
-    }
+    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
 
+    // 1) Vision: detectar cartas
     const payload = {
       model: "gpt-4o-mini",
       messages: [
@@ -38,15 +104,12 @@ app.post("/api/scan", async (req, res) => {
                 "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
                 "Reglas:\n" +
                 "- confidence entre 0.0 y 1.0\n" +
-                "- set: nombre del set/expansión si se puede inferir, si no pon \"\"\n" +
-                "- collector_number: el número de colección si se ve (ej: \"12/108\" o \"12\"), si no pon \"\"\n" +
-                "- Si una carta se repite, inclúyela igual.\n"
+                "- set: nombre del set/expansión si se puede inferir, si no \"\"\n" +
+                "- collector_number: número visible, si no \"\"\n"
             },
             {
               type: "image_url",
-              image_url: {
-                url: "data:image/jpeg;base64," + imageBase64
-              }
+              image_url: { url: "data:image/jpeg;base64," + imageBase64 }
             }
           ]
         }
@@ -64,52 +127,60 @@ app.post("/api/scan", async (req, res) => {
 
     const data = await r.json();
 
-    // ----- Parsear y normalizar salida -----
     let text = data?.choices?.[0]?.message?.content ?? "";
     text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
 
     let parsed = null;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = null;
-    }
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
 
     let cards = [];
-
     if (parsed && Array.isArray(parsed.cards)) {
       cards = parsed.cards.map((c) => ({
         name: (c?.name || "").toString().trim(),
         set: (c?.set || "").toString().trim(),
         collector_number: (c?.collector_number || "").toString().trim(),
-        confidence: Number(c?.confidence ?? 0)
-      }));
-    } else {
-      // fallback: si algo sale mal, devuelvo solo nombres
-      const lines = text
-        .split("\n")
-        .map((s) => s.replace(/^[-•\d.]+\s*/, "").trim())
-        .filter(Boolean);
-
-      cards = lines.map((name) => ({
-        name,
-        set: "",
-        collector_number: "",
-        confidence: 0.3
+        confidence: Math.max(0, Math.min(1, Number(c?.confidence ?? 0)))
       }));
     }
 
-    // limpieza final
-    cards = cards
-      .filter((c) => c.name)
-      .map((c) => ({
-        name: c.name.replace(/[`"]/g, "").trim(),
-        set: c.set.replace(/[`"]/g, "").trim(),
-        collector_number: c.collector_number.replace(/[`"]/g, "").trim(),
-        confidence: Math.max(0, Math.min(1, isNaN(c.confidence) ? 0 : c.confidence))
-      }));
+    cards = cards.filter(c => c.name);
 
-    return res.json({ cards });
+    // 2) Enriquecer con TCGdex (precio)
+    const enriched = [];
+
+    for (const c of cards) {
+      const localIdWanted = normalizeCollectorNumber(c.collector_number);
+
+      // Buscar candidatos por nombre
+      const candidates = await tcgdexSearchByName(c.name);
+
+      // Elegir mejor candidato por número si existe
+      const best = pickBestCandidate(candidates, localIdWanted);
+
+      let tcgdex_id = null;
+      let price_usd = null;
+      let price_eur = null;
+
+      if (best?.id) {
+        tcgdex_id = best.id;
+
+        const full = await tcgdexGetCardById(best.id);
+        if (full) {
+          const prices = extractPricesFromTcgdexCard(full);
+          price_usd = prices.price_usd;
+          price_eur = prices.price_eur;
+        }
+      }
+
+      enriched.push({
+        ...c,
+        tcgdex_id,
+        price_usd,
+        price_eur
+      });
+    }
+
+    return res.json({ cards: enriched });
   } catch (e) {
     return res.status(500).json({ error: "Fallo al analizar imagen" });
   }
