@@ -5,78 +5,52 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "12mb" }));
 
-const TCGDEX_BASE = "https://api.tcgdex.net/v2/en";
+const POKEMONTCG_BASE = "https://api.pokemontcg.io/v2";
+const PLACEHOLDER_IMG =
+  "https://via.placeholder.com/220x308.png?text=No+Image";
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 function normalizeCollectorNumber(s) {
   if (!s) return "";
-  return String(s).split("/")[0].trim();
+  return String(s).split("/")[0].trim(); // "12/108" -> "12"
 }
 
-function safeNumber(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
+async function pokemonTcgSearchCard({ name, collector_number, setName }) {
+  const apiKey = process.env.POKEMONTCG_API_KEY;
+  if (!apiKey) return null;
 
-async function tcgdexSearchByName(name) {
-  const url = `${TCGDEX_BASE}/cards?name=${encodeURIComponent(name)}`;
-  const r = await fetch(url);
-  if (!r.ok) return [];
-  const data = await r.json();
-  return Array.isArray(data) ? data : [];
-}
+  const cleanName = String(name || "").replace(/"/g, "").trim();
+  if (!cleanName) return null;
 
-async function tcgdexGetCardById(id) {
-  const url = `${TCGDEX_BASE}/cards/${encodeURIComponent(id)}`;
-  const r = await fetch(url);
+  const num = normalizeCollectorNumber(collector_number);
+
+  // Query v2: name:"..." number:"..." (si hay número)
+  let q = `name:"${cleanName}"`;
+  if (num) q += ` number:"${String(num).replace(/"/g, "")}"`;
+
+  const url = `${POKEMONTCG_BASE}/cards?q=${encodeURIComponent(q)}&pageSize=20`;
+
+  const r = await fetch(url, {
+    headers: { "X-Api-Key": apiKey }
+  });
+
   if (!r.ok) return null;
-  return await r.json();
-}
 
-function pickBestCandidate(candidates, localIdWanted) {
-  if (!candidates.length) return null;
+  const data = await r.json();
+  const list = Array.isArray(data?.data) ? data.data : [];
+  if (!list.length) return null;
 
-  if (localIdWanted) {
-    const exact = candidates.find(c => String(c.localId) === String(localIdWanted));
-    if (exact) return exact;
-
-    const starts = candidates.find(c => String(c.localId).startsWith(String(localIdWanted)));
-    if (starts) return starts;
+  // Mejor match por set si viene
+  if (setName) {
+    const target = String(setName).toLowerCase();
+    const bySet = list.find(c =>
+      String(c?.set?.name || "").toLowerCase().includes(target)
+    );
+    if (bySet) return bySet;
   }
 
-  return candidates[0];
-}
-
-function extractPricesFromTcgdexCard(fullCard) {
-  const pricing = fullCard?.pricing || {};
-  const tcg = pricing?.tcgplayer || null;
-  const cm = pricing?.cardmarket || null;
-
-  const usd =
-    safeNumber(tcg?.normal?.marketPrice) ??
-    safeNumber(tcg?.holofoil?.marketPrice) ??
-    safeNumber(tcg?.["reverse-holofoil"]?.marketPrice) ??
-    safeNumber(tcg?.normal?.midPrice) ??
-    safeNumber(tcg?.holofoil?.midPrice) ??
-    safeNumber(tcg?.["reverse-holofoil"]?.midPrice) ??
-    null;
-
-  const eur =
-    safeNumber(cm?.trend) ??
-    safeNumber(cm?.["trend-holo"]) ??
-    safeNumber(cm?.avg) ??
-    safeNumber(cm?.["avg-holo"]) ??
-    null;
-
-  return { price_usd: usd, price_eur: eur };
-}
-
-function extractImageUrlFromFull(fullCard) {
-  const img = fullCard?.image;
-  if (!img) return null;
-  if (typeof img === "string") return img;
-  return img.large || img.high || img.small || img.low || null;
+  return list[0];
 }
 
 app.post("/api/scan", async (req, res) => {
@@ -84,9 +58,10 @@ app.post("/api/scan", async (req, res) => {
     const { imageBase64 } = req.body;
     if (!imageBase64) return res.status(400).json({ error: "Falta imageBase64" });
 
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
 
+    // 1) Detectar nombres con OpenAI
     const payload = {
       model: "gpt-4o-mini",
       messages: [
@@ -99,11 +74,7 @@ app.post("/api/scan", async (req, res) => {
                 "En esta foto hay un binder con 9 cartas Pokémon.\n" +
                 "Devuelve SOLO JSON válido, SIN markdown y SIN ```.\n" +
                 "Formato exacto:\n" +
-                "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
-                "Reglas:\n" +
-                "- confidence entre 0.0 y 1.0\n" +
-                "- set: si no sabes pon \"\"\n" +
-                "- collector_number: si no sabes pon \"\"\n"
+                "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n"
             },
             { type: "image_url", image_url: { url: "data:image/jpeg;base64," + imageBase64 } }
           ]
@@ -115,7 +86,7 @@ app.post("/api/scan", async (req, res) => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
+        "Authorization": `Bearer ${openaiKey}`
       },
       body: JSON.stringify(payload)
     });
@@ -139,42 +110,23 @@ app.post("/api/scan", async (req, res) => {
     }
     cards = cards.filter(c => c.name);
 
+    // 2) Enriquecer: buscar imagen oficial con PokémonTCG
     const enriched = [];
-
     for (const c of cards) {
-      const localIdWanted = normalizeCollectorNumber(c.collector_number);
+      const found = await pokemonTcgSearchCard({
+        name: c.name,
+        collector_number: c.collector_number,
+        setName: c.set
+      });
 
-      const candidates = await tcgdexSearchByName(c.name);
-      const best = pickBestCandidate(candidates, localIdWanted);
-
-      let tcgdex_id = null;
-      let image_url = null;
-      let price_usd = null;
-      let price_eur = null;
-
-      // ✅ CLAVE: si el candidato trae image, úsala ya (miniatura segura)
-      if (best?.image) image_url = best.image;
-      if (best?.id) tcgdex_id = best.id;
-
-      // Intentar enriquecer con detalle (precios + mejor imagen si existe)
-      if (best?.id) {
-        const full = await tcgdexGetCardById(best.id);
-        if (full) {
-          const prices = extractPricesFromTcgdexCard(full);
-          price_usd = prices.price_usd;
-          price_eur = prices.price_eur;
-
-          const imgFromFull = extractImageUrlFromFull(full);
-          if (imgFromFull) image_url = imgFromFull; // preferir imagen del detalle
-        }
-      }
+      const image_url =
+        found?.images?.large ||
+        found?.images?.small ||
+        PLACEHOLDER_IMG;
 
       enriched.push({
         ...c,
-        tcgdex_id,
-        image_url,     // ✅ SIEMPRE intentamos devolverla
-        price_usd,
-        price_eur
+        image_url
       });
     }
 
