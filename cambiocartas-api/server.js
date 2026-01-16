@@ -11,7 +11,6 @@ app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 function normalizeCollectorNumber(s) {
   if (!s) return "";
-  // "12/108" -> "12"
   return String(s).split("/")[0].trim();
 }
 
@@ -73,21 +72,11 @@ function extractPricesFromTcgdexCard(fullCard) {
   return { price_usd: usd, price_eur: eur };
 }
 
-function extractImageUrlFromTcgdexCard(fullCard) {
-  // TCGdex suele entregar "image" como objeto con tamaños o como string
-  // Probamos varias opciones y devolvemos la primera que exista
+function extractImageUrlFromFull(fullCard) {
   const img = fullCard?.image;
   if (!img) return null;
-
   if (typeof img === "string") return img;
-
-  return (
-    img.large ||
-    img.high ||
-    img.small ||
-    img.low ||
-    null
-  );
+  return img.large || img.high || img.small || img.low || null;
 }
 
 app.post("/api/scan", async (req, res) => {
@@ -98,7 +87,6 @@ app.post("/api/scan", async (req, res) => {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
 
-    // 1) OpenAI Vision: detectar cartas (solo metadata)
     const payload = {
       model: "gpt-4o-mini",
       messages: [
@@ -114,14 +102,10 @@ app.post("/api/scan", async (req, res) => {
                 "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n" +
                 "Reglas:\n" +
                 "- confidence entre 0.0 y 1.0\n" +
-                "- set: nombre del set/expansión si se puede inferir, si no \"\"\n" +
-                "- collector_number: número visible (ej: \"12/108\" o \"12\"), si no \"\"\n" +
-                "- Si una carta se repite, inclúyela igual.\n"
+                "- set: si no sabes pon \"\"\n" +
+                "- collector_number: si no sabes pon \"\"\n"
             },
-            {
-              type: "image_url",
-              image_url: { url: "data:image/jpeg;base64," + imageBase64 }
-            }
+            { type: "image_url", image_url: { url: "data:image/jpeg;base64," + imageBase64 } }
           ]
         }
       ]
@@ -153,10 +137,8 @@ app.post("/api/scan", async (req, res) => {
         confidence: Math.max(0, Math.min(1, Number(c?.confidence ?? 0)))
       }));
     }
-
     cards = cards.filter(c => c.name);
 
-    // 2) Enriquecer con TCGdex: imagen + precios
     const enriched = [];
 
     for (const c of cards) {
@@ -170,23 +152,27 @@ app.post("/api/scan", async (req, res) => {
       let price_usd = null;
       let price_eur = null;
 
-      if (best?.id) {
-        tcgdex_id = best.id;
+      // ✅ CLAVE: si el candidato trae image, úsala ya (miniatura segura)
+      if (best?.image) image_url = best.image;
+      if (best?.id) tcgdex_id = best.id;
 
+      // Intentar enriquecer con detalle (precios + mejor imagen si existe)
+      if (best?.id) {
         const full = await tcgdexGetCardById(best.id);
         if (full) {
           const prices = extractPricesFromTcgdexCard(full);
           price_usd = prices.price_usd;
           price_eur = prices.price_eur;
 
-          image_url = extractImageUrlFromTcgdexCard(full);
+          const imgFromFull = extractImageUrlFromFull(full);
+          if (imgFromFull) image_url = imgFromFull; // preferir imagen del detalle
         }
       }
 
       enriched.push({
         ...c,
         tcgdex_id,
-        image_url,
+        image_url,     // ✅ SIEMPRE intentamos devolverla
         price_usd,
         price_eur
       });
