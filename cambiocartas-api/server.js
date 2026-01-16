@@ -1,38 +1,32 @@
-let text = data?.choices?.[0]?.message?.content ?? "";
+import express from "express";
+import cors from "cors";
 
-// 1) Limpieza típica: quitar fences ```json ... ```
-text = text
-  .replace(/```json/gi, "")
-  .replace(/```/g, "")
-  .trim();
+const app = express();
 
-// 2) Intentar JSON directo
-let parsed = null;
-try {
-  parsed = JSON.parse(text);
-} catch (e) {
-  parsed = null;
-}
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "12mb" }));
 
-// 3) Normalizar a lista de nombres
-let names = [];
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
+});
 
-if (parsed && Array.isArray(parsed.cards)) {
-  // cards puede venir como [{name:""}] o ["name"]
-  names = parsed.cards.map(c => (typeof c === "string" ? c : c?.name || ""));
-} else {
-  // Fallback: sacar líneas (y limpiar bullets)
-  names = text
-    .split("\n")
-    .map(s => s.replace(/^[-•\d.]+\s*/, "").trim())
-    .filter(Boolean);
-}
+app.post("/api/scan", async (req, res) => {
+  try {
+    const { imageBase64 } = req.body;
 
-// 4) Limpieza final: quitar comillas/backticks raros y eliminar vacíos/duplicados
-names = names
-  .map(n => n.replace(/[`"]/g, "").trim())
-  .filter(Boolean);
+    if (!imageBase64) {
+      return res.status(400).json({ error: "Falta imageBase64" });
+    }
 
-const unique = [...new Set(names)];
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
+    }
 
-res.json({ cards: unique.map(name => ({ name })) });
+    const payload = {
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
