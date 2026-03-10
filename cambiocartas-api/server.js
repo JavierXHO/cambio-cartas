@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 app.use(cors());
@@ -15,6 +17,38 @@ const POKEMON_API_KEY =
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/1.png";
+
+const DATA_DIR = path.join(process.cwd(), "data");
+const CARDS_FILE = path.join(DATA_DIR, "cards.json");
+
+/* ---------------- ARCHIVOS ---------------- */
+
+function ensureDataFile() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+
+  if (!fs.existsSync(CARDS_FILE)) {
+    fs.writeFileSync(CARDS_FILE, "[]", "utf8");
+  }
+}
+
+function readCardsFile() {
+  ensureDataFile();
+
+  try {
+    const raw = fs.readFileSync(CARDS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCardsFile(cards) {
+  ensureDataFile();
+  fs.writeFileSync(CARDS_FILE, JSON.stringify(cards, null, 2), "utf8");
+}
 
 /* ---------------- UTILIDADES ---------------- */
 
@@ -58,6 +92,13 @@ function extractJsonBlock(text) {
     .trim();
 }
 
+function makeId() {
+  return (
+    Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 8)
+  );
+}
+
 /* ---------------- POKEMON API ---------------- */
 
 async function pokemonFetch(url) {
@@ -92,7 +133,6 @@ async function findImageUrl(name, setValue, collector_number) {
     const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=50`);
     const list = Array.isArray(data?.data) ? data.data : [];
 
-    // 1) Match exacto: nombre + set + número
     const exact = list.find((card) => {
       const apiName = normalizeNameForMatch(card?.name);
       const apiSetId = normalizeSetForMatch(card?.set?.id);
@@ -115,7 +155,6 @@ async function findImageUrl(name, setValue, collector_number) {
       return exact.images.small || exact.images.large;
     }
 
-    // 2) Match exacto: solo nombre
     const exactNameOnly = list.find((card) => {
       const apiName = normalizeNameForMatch(card?.name);
       return apiName === wantedName;
@@ -125,7 +164,6 @@ async function findImageUrl(name, setValue, collector_number) {
       return exactNameOnly.images.small || exactNameOnly.images.large;
     }
 
-    // 3) Si no hay match real, placeholder
     return PLACEHOLDER_IMG;
   } catch (err) {
     console.error("findImageUrl error:", err);
@@ -167,7 +205,6 @@ async function findPrices(name, setValue, collector_number) {
     });
 
     const card = exact || null;
-
     if (!card) return { usd: null, eur: null };
 
     const usd =
@@ -317,6 +354,62 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+app.get("/api/cards", (req, res) => {
+  try {
+    const cards = readCardsFile()
+      .filter((c) => c.active !== false)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    return res.json({ cards });
+  } catch (err) {
+    console.error("GET /api/cards error:", err);
+    return res.status(500).json({ error: "cards_read_failed" });
+  }
+});
+
+app.post("/api/publish", (req, res) => {
+  try {
+    const { cards } = req.body;
+
+    if (!Array.isArray(cards) || cards.length === 0) {
+      return res.status(400).json({ error: "missing_cards" });
+    }
+
+    const currentCards = readCardsFile();
+
+    const prepared = cards.map((card) => ({
+      id: makeId(),
+      name: String(card?.name || "").trim(),
+      set: String(card?.set || "").trim(),
+      collector_number: String(card?.collector_number || "").trim(),
+      confidence: String(card?.confidence || "").trim(),
+      image_url: String(card?.image_url || "").trim(),
+      price_usd: card?.price_usd ?? null,
+      price_eur: card?.price_eur ?? null,
+      user_price: card?.user_price ?? null,
+      estado: String(card?.estado || "").trim(),
+      created_at: new Date().toISOString(),
+      active: true
+    })).filter((c) => c.name);
+
+    if (!prepared.length) {
+      return res.status(400).json({ error: "no_valid_cards" });
+    }
+
+    const updated = [...currentCards, ...prepared];
+    writeCardsFile(updated);
+
+    return res.json({
+      ok: true,
+      saved: prepared.length,
+      cards: prepared
+    });
+  } catch (err) {
+    console.error("POST /api/publish error:", err);
+    return res.status(500).json({ error: "publish_failed" });
+  }
+});
+
 app.post("/api/scan", async (req, res) => {
   try {
     const { imageBase64 } = req.body;
@@ -368,6 +461,8 @@ app.post("/api/scan", async (req, res) => {
 });
 
 /* ---------------- SERVER ---------------- */
+
+ensureDataFile();
 
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
