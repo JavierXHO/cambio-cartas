@@ -14,7 +14,6 @@ const POKEMON_API_KEY =
   "";
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
 const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/1.png";
 
 /* ---------------- UTILIDADES ---------------- */
@@ -90,7 +89,7 @@ async function findImageUrl(name, setValue, collector_number) {
     const wantedSet = normalizeSetForMatch(cleanSet);
 
     const q = `name:"${cleanName}"`;
-    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=30`);
+    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=50`);
     const list = Array.isArray(data?.data) ? data.data : [];
 
     // 1) Match exacto: nombre + set + número
@@ -116,28 +115,17 @@ async function findImageUrl(name, setValue, collector_number) {
       return exact.images.small || exact.images.large;
     }
 
-    // 2) Match exacto: nombre + set
-    const exactSet = list.find((card) => {
+    // 2) Match exacto: solo nombre
+    const exactNameOnly = list.find((card) => {
       const apiName = normalizeNameForMatch(card?.name);
-      const apiSetId = normalizeSetForMatch(card?.set?.id);
-      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
-      const apiSetName = normalizeSetForMatch(card?.set?.name);
-
-      const sameName = apiName === wantedName;
-      const sameSet =
-        !wantedSet ||
-        apiSetId === wantedSet ||
-        apiSetCode === wantedSet ||
-        apiSetName === wantedSet;
-
-      return sameName && sameSet;
+      return apiName === wantedName;
     });
 
-    if (exactSet?.images?.small || exactSet?.images?.large) {
-      return exactSet.images.small || exactSet.images.large;
+    if (exactNameOnly?.images?.small || exactNameOnly?.images?.large) {
+      return exactNameOnly.images.small || exactNameOnly.images.large;
     }
 
-    // 3) Si no hay match real, mejor placeholder
+    // 3) Si no hay match real, placeholder
     return PLACEHOLDER_IMG;
   } catch (err) {
     console.error("findImageUrl error:", err);
@@ -145,11 +133,42 @@ async function findImageUrl(name, setValue, collector_number) {
   }
 }
 
-async function findPrices(name) {
+async function findPrices(name, setValue, collector_number) {
   try {
-    const q = `name:"${name}"`;
-    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=1`);
-    const card = data?.data?.[0];
+    const cleanName = String(name || "").replace(/"/g, "").trim();
+    const cleanSet = String(setValue || "").trim();
+    const n = normNum(collector_number);
+
+    if (!cleanName) return { usd: null, eur: null };
+
+    const wantedName = normalizeNameForMatch(cleanName);
+    const wantedSet = normalizeSetForMatch(cleanSet);
+
+    const q = `name:"${cleanName}"`;
+    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=50`);
+    const list = Array.isArray(data?.data) ? data.data : [];
+
+    const exact = list.find((card) => {
+      const apiName = normalizeNameForMatch(card?.name);
+      const apiSetId = normalizeSetForMatch(card?.set?.id);
+      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
+      const apiSetName = normalizeSetForMatch(card?.set?.name);
+      const apiNumber = normNum(card?.number);
+
+      const sameName = apiName === wantedName;
+      const sameSet =
+        !wantedSet ||
+        apiSetId === wantedSet ||
+        apiSetCode === wantedSet ||
+        apiSetName === wantedSet;
+      const sameNumber = !n || apiNumber === n;
+
+      return sameName && sameSet && sameNumber;
+    });
+
+    const card = exact || null;
+
+    if (!card) return { usd: null, eur: null };
 
     const usd =
       card?.tcgplayer?.prices?.holofoil?.market ||
@@ -235,7 +254,6 @@ async function detectCardsWithOpenAI(imageBase64) {
 
 function parseDetectedCards(rawText) {
   const cleaned = extractJsonBlock(rawText);
-
   let parsed = safeJsonParse(cleaned);
 
   if (parsed && Array.isArray(parsed.cards)) {
@@ -322,7 +340,7 @@ app.post("/api/scan", async (req, res) => {
 
     for (const card of cards) {
       const img = await findImageUrl(card.name, card.set, card.collector_number);
-      const prices = await findPrices(card.name);
+      const prices = await findPrices(card.name, card.set, card.collector_number);
 
       result.push({
         name: card.name || "",
