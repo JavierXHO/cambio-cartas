@@ -1,8 +1,5 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -153,6 +150,7 @@ app.post("/api/scan", async (req, res) => {
     const json = await openaiRes.json();
 
     let text = json?.choices?.[0]?.message?.content || "";
+
     text = text.replace(/```json/g, "").replace(/```/g, "").trim();
 
     let parsed;
@@ -164,6 +162,7 @@ app.post("/api/scan", async (req, res) => {
     }
 
     const cards = parsed.cards || [];
+
     const result = [];
 
     for (const card of cards) {
@@ -181,14 +180,18 @@ app.post("/api/scan", async (req, res) => {
       });
     }
 
-    res.json({ cards: result });
+    res.json({
+      cards: result,
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "scan_failed" });
+    res.status(500).json({
+      error: "scan_failed",
+    });
   }
 });
 
-/* ---------------- START SERVER ---------------- */
+/* ---------------- SERVER ---------------- */
 
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
