@@ -1,39 +1,48 @@
 import express from "express";
 import cors from "cors";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "12mb" }));
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-// Imagen (PokemonTCG)
-const POKEMONTCG_BASE = "https://api.pokemontcg.io/v2";
-const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/4.png";
+const PORT = process.env.PORT || 3000;
 
-// Precios (TCGdex)
-const TCGDEX_BASE = "https://api.tcgdex.net/v2/en";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const POKEMON_API_KEY = process.env.POKEMON_API_KEY || "";
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+const PLACEHOLDER_IMG =
+  "https://images.pokemontcg.io/base1/1.png";
 
-function normNum(s) {
-  if (!s) return "";
-  return String(s).split("/")[0].trim(); // "64/108" -> "64"
+function normNum(n) {
+  return String(n || "")
+    .split("/")
+    .shift()
+    .replace(/[^\d]/g, "")
+    .trim();
 }
 
-function safeNumber(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
+function normalizeNameForMatch(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// ---------------- PokemonTCG (imagenes) ----------------
-async function pokemonFetch(path) {
-  const apiKey = process.env.POKEMONTCG_API_KEY;
-  if (!apiKey) return null;
-
-  const r = await fetch(`${POKEMONTCG_BASE}${path}`, {
-    headers: { "X-Api-Key": apiKey }
+async function pokemonFetch(url) {
+  const res = await fetch("https://api.pokemontcg.io/v2" + url, {
+    headers: {
+      "X-Api-Key": POKEMON_API_KEY,
+    },
   });
-  if (!r.ok) return null;
-  return await r.json();
+
+  return res.json();
 }
 
 async function findImageUrl(name, collector_number) {
@@ -42,172 +51,151 @@ async function findImageUrl(name, collector_number) {
 
   if (!cleanName) return PLACEHOLDER_IMG;
 
-  // 1) name + number (más exacto)
+  const wantedName = normalizeNameForMatch(cleanName);
+
   if (n) {
     const q1 = `name:"${cleanName}" number:"${n}"`;
-    const d1 = await pokemonFetch(`/cards?q=${encodeURIComponent(q1)}&pageSize=5`);
+    const d1 = await pokemonFetch(`/cards?q=${encodeURIComponent(q1)}&pageSize=10`);
     const list1 = Array.isArray(d1?.data) ? d1.data : [];
-    const hit1 = list1[0];
-    const img1 = hit1?.images?.small || hit1?.images?.large;
-    if (img1) return img1;
+
+    const exact1 = list1.find(card =>
+      normalizeNameForMatch(card?.name) === wantedName &&
+      String(card?.number || "") === String(n)
+    );
+
+    if (exact1?.images?.small || exact1?.images?.large) {
+      return exact1.images.small || exact1.images.large;
+    }
   }
 
-  // 2) fallback: name solo
-  const q2 = `name:${cleanName}`;
-  const d2 = await pokemonFetch(`/cards?q=${encodeURIComponent(q2)}&pageSize=1`);
+  const q2 = `name:"${cleanName}"`;
+  const d2 = await pokemonFetch(`/cards?q=${encodeURIComponent(q2)}&pageSize=10`);
   const list2 = Array.isArray(d2?.data) ? d2.data : [];
-  const hit2 = list2[0];
-  const img2 = hit2?.images?.small || hit2?.images?.large;
 
-  return img2 || PLACEHOLDER_IMG;
-}
+  const exact2 = list2.find(card =>
+    normalizeNameForMatch(card?.name) === wantedName
+  );
 
-// ---------------- TCGdex (precios USD/EUR) ----------------
-async function tcgdexSearchByName(name) {
-  const url = `${TCGDEX_BASE}/cards?name=${encodeURIComponent(name)}`;
-  const r = await fetch(url);
-  if (!r.ok) return [];
-  const data = await r.json();
-  return Array.isArray(data) ? data : [];
-}
-
-async function tcgdexGetCardById(id) {
-  const url = `${TCGDEX_BASE}/cards/${encodeURIComponent(id)}`;
-  const r = await fetch(url);
-  if (!r.ok) return null;
-  return await r.json();
-}
-
-function pickBestCandidate(candidates, wantedLocalId) {
-  if (!candidates.length) return null;
-
-  // intenta calzar número (localId en tcgdex suele ser el número del set)
-  if (wantedLocalId) {
-    const exact = candidates.find(c => String(c.localId) === String(wantedLocalId));
-    if (exact) return exact;
-
-    const starts = candidates.find(c => String(c.localId).startsWith(String(wantedLocalId)));
-    if (starts) return starts;
+  if (exact2?.images?.small || exact2?.images?.large) {
+    return exact2.images.small || exact2.images.large;
   }
 
-  return candidates[0];
+  return PLACEHOLDER_IMG;
 }
 
-function extractPricesFromTcgdexCard(fullCard) {
-  const pricing = fullCard?.pricing || {};
-  const tcg = pricing?.tcgplayer || null;
-  const cm = pricing?.cardmarket || null;
+async function findPrices(name) {
+  try {
+    const q = `name:"${name}"`;
+    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=1`);
 
-  // USD: prioridad marketPrice, si no midPrice
-  const usd =
-    safeNumber(tcg?.normal?.marketPrice) ??
-    safeNumber(tcg?.holofoil?.marketPrice) ??
-    safeNumber(tcg?.["reverse-holofoil"]?.marketPrice) ??
-    safeNumber(tcg?.normal?.midPrice) ??
-    safeNumber(tcg?.holofoil?.midPrice) ??
-    safeNumber(tcg?.["reverse-holofoil"]?.midPrice) ??
-    null;
+    const card = data?.data?.[0];
 
-  // EUR: prioridad trend, si no avg
-  const eur =
-    safeNumber(cm?.trend) ??
-    safeNumber(cm?.["trend-holo"]) ??
-    safeNumber(cm?.avg) ??
-    safeNumber(cm?.["avg-holo"]) ??
-    null;
+    const usd = card?.tcgplayer?.prices?.holofoil?.market
+      || card?.tcgplayer?.prices?.normal?.market
+      || null;
 
-  return { price_usd: usd, price_eur: eur };
+    const eur = card?.cardmarket?.prices?.averageSellPrice || null;
+
+    return {
+      usd,
+      eur
+    };
+  } catch {
+    return {
+      usd: null,
+      eur: null
+    };
+  }
 }
 
-async function findPrices(name, collector_number) {
-  const wantedLocalId = normNum(collector_number);
-  const candidates = await tcgdexSearchByName(name);
-  const best = pickBestCandidate(candidates, wantedLocalId);
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
+});
 
-  if (!best?.id) return { price_usd: null, price_eur: null };
-
-  const full = await tcgdexGetCardById(best.id);
-  if (!full) return { price_usd: null, price_eur: null };
-
-  return extractPricesFromTcgdexCard(full);
-}
-
-// ---------------- SCAN ----------------
 app.post("/api/scan", async (req, res) => {
   try {
     const { imageBase64 } = req.body;
-    if (!imageBase64) return res.status(400).json({ error: "Falta imageBase64" });
 
-    const openaiKey = process.env.OPENAI_API_KEY;
-    if (!openaiKey) return res.status(500).json({ error: "OPENAI_API_KEY no configurada" });
-
-    const payload = {
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "En esta foto hay un binder con cartas Pokémon.\n" +
-                "Devuelve SOLO JSON válido (sin markdown, sin ```).\n" +
-                "Formato exacto:\n" +
-                "{\"cards\":[{\"name\":\"\",\"set\":\"\",\"collector_number\":\"\",\"confidence\":0.0}]}\n"
-            },
-            { type: "image_url", image_url: { url: "data:image/jpeg;base64," + imageBase64 } }
-          ]
-        }
-      ]
-    };
-
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Detecta cartas Pokémon en la imagen y devuelve JSON con name, set y collector_number."
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Detecta las cartas Pokémon."
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/jpeg;base64,${imageBase64}`
+                }
+              }
+            ]
+          }
+        ],
+        max_tokens: 500
+      })
     });
 
-    const data = await r.json();
+    const json = await openaiRes.json();
 
-    let text = data?.choices?.[0]?.message?.content ?? "";
-    text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+    let text = json?.choices?.[0]?.message?.content || "";
 
-    let parsed = null;
-    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    text = text.replace(/```json/g, "").replace(/```/g, "").trim();
 
-    let cards = [];
-    if (parsed && Array.isArray(parsed.cards)) {
-      cards = parsed.cards
-        .map(c => ({
-          name: String(c?.name || "").trim(),
-          set: String(c?.set || "").trim(),
-          collector_number: String(c?.collector_number || "").trim(),
-          confidence: Math.max(0, Math.min(1, Number(c?.confidence ?? 0)))
-        }))
-        .filter(c => c.name);
+    let parsed;
+
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { cards: [] };
     }
 
-    const enriched = [];
-    for (const c of cards) {
-      const image_url = await findImageUrl(c.name, c.collector_number);
-      const prices = await findPrices(c.name, c.collector_number);
+    const cards = parsed.cards || [];
 
-      enriched.push({
-        ...c,
-        image_url,
-        price_usd: prices.price_usd,
-        price_eur: prices.price_eur
+    const result = [];
+
+    for (const card of cards) {
+
+      const img = await findImageUrl(card.name, card.collector_number);
+      const prices = await findPrices(card.name);
+
+      result.push({
+        name: card.name || "",
+        set: card.set || "",
+        collector_number: card.collector_number || "",
+        confidence: 0.9,
+        image_url: img,
+        price_usd: prices.usd,
+        price_eur: prices.eur
       });
     }
 
-    return res.json({ cards: enriched });
-  } catch {
-    return res.status(500).json({ error: "Fallo al analizar imagen" });
+    res.json({
+      cards: result
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: "scan_failed"
+    });
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("API running on port", port));
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
+});
