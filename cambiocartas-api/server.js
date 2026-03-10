@@ -13,6 +13,8 @@ const POKEMON_API_KEY =
   process.env.POKEMONTCG_API_KEY ||
   "";
 
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
 const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/1.png";
 
 /* ---------------- UTILIDADES ---------------- */
@@ -44,8 +46,7 @@ function safeJsonParse(text) {
 }
 
 function extractJsonBlock(text) {
-  if (!text) return "";
-  return String(text)
+  return String(text || "")
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
@@ -54,54 +55,64 @@ function extractJsonBlock(text) {
 /* ---------------- POKEMON API ---------------- */
 
 async function pokemonFetch(url) {
-  const res = await fetch("https://api.pokemontcg.io/v2" + url, {
-    headers: {
-      "X-Api-Key": POKEMON_API_KEY,
-    },
-  });
+  const headers = {};
+
+  if (POKEMON_API_KEY) {
+    headers["X-Api-Key"] = POKEMON_API_KEY;
+  }
+
+  const res = await fetch("https://api.pokemontcg.io/v2" + url, { headers });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`pokemon_api_http_${res.status}: ${txt}`);
+  }
 
   return res.json();
 }
 
 async function findImageUrl(name, collector_number) {
-  const cleanName = String(name || "").replace(/"/g, "").trim();
-  const n = normNum(collector_number);
+  try {
+    const cleanName = String(name || "").replace(/"/g, "").trim();
+    const n = normNum(collector_number);
 
-  if (!cleanName) return PLACEHOLDER_IMG;
+    if (!cleanName) return PLACEHOLDER_IMG;
 
-  const wantedName = normalizeNameForMatch(cleanName);
+    const wantedName = normalizeNameForMatch(cleanName);
 
-  // 1) nombre + número
-  if (n) {
-    const q1 = `name:"${cleanName}" number:"${n}"`;
-    const d1 = await pokemonFetch(`/cards?q=${encodeURIComponent(q1)}&pageSize=10`);
-    const list1 = Array.isArray(d1?.data) ? d1.data : [];
+    if (n) {
+      const q1 = `name:"${cleanName}" number:"${n}"`;
+      const d1 = await pokemonFetch(`/cards?q=${encodeURIComponent(q1)}&pageSize=10`);
+      const list1 = Array.isArray(d1?.data) ? d1.data : [];
 
-    const exact1 = list1.find(
-      (card) =>
-        normalizeNameForMatch(card?.name) === wantedName &&
-        String(card?.number || "") === String(n)
+      const exact1 = list1.find(
+        (card) =>
+          normalizeNameForMatch(card?.name) === wantedName &&
+          String(card?.number || "") === String(n)
+      );
+
+      if (exact1?.images?.small || exact1?.images?.large) {
+        return exact1.images.small || exact1.images.large;
+      }
+    }
+
+    const q2 = `name:"${cleanName}"`;
+    const d2 = await pokemonFetch(`/cards?q=${encodeURIComponent(q2)}&pageSize=10`);
+    const list2 = Array.isArray(d2?.data) ? d2.data : [];
+
+    const exact2 = list2.find(
+      (card) => normalizeNameForMatch(card?.name) === wantedName
     );
 
-    if (exact1?.images?.small || exact1?.images?.large) {
-      return exact1.images.small || exact1.images.large;
+    if (exact2?.images?.small || exact2?.images?.large) {
+      return exact2.images.small || exact2.images.large;
     }
+
+    return PLACEHOLDER_IMG;
+  } catch (err) {
+    console.error("findImageUrl error:", err);
+    return PLACEHOLDER_IMG;
   }
-
-  // 2) solo nombre exacto
-  const q2 = `name:"${cleanName}"`;
-  const d2 = await pokemonFetch(`/cards?q=${encodeURIComponent(q2)}&pageSize=10`);
-  const list2 = Array.isArray(d2?.data) ? d2.data : [];
-
-  const exact2 = list2.find(
-    (card) => normalizeNameForMatch(card?.name) === wantedName
-  );
-
-  if (exact2?.images?.small || exact2?.images?.large) {
-    return exact2.images.small || exact2.images.large;
-  }
-
-  return PLACEHOLDER_IMG;
 }
 
 async function findPrices(name) {
@@ -118,65 +129,85 @@ async function findPrices(name) {
     const eur = card?.cardmarket?.prices?.averageSellPrice || null;
 
     return { usd, eur };
-  } catch {
+  } catch (err) {
+    console.error("findPrices error:", err);
     return { usd: null, eur: null };
   }
 }
 
-/* ---------------- OPENAI DETECCIÓN ---------------- */
+/* ---------------- OPENAI ---------------- */
 
 async function detectCardsWithOpenAI(imageBase64) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("missing_openai_api_key");
+  }
+
+  const body = {
+    model: OPENAI_MODEL,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Eres un detector de cartas Pokémon en fotos de binders. Debes responder SOLO JSON válido."
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              'Analiza la imagen y detecta las cartas Pokémon visibles. ' +
+              'Devuelve SOLO un JSON válido con esta estructura exacta: ' +
+              '{"cards":[{"name":"","set":"","collector_number":"","confidence":0.0}]}. ' +
+              'Si no estás seguro del set o número, déjalos vacíos. ' +
+              'No escribas texto fuera del JSON.'
+          },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:image/jpeg;base64,${imageBase64}`
+            }
+          }
+        ]
+      }
+    ],
+    max_tokens: 900
+  };
+
   const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Eres un detector de cartas Pokémon en fotos de binders. Debes responder SOLO JSON válido."
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                'Analiza la imagen y detecta las cartas Pokémon visibles. ' +
-                'Devuelve SOLO un JSON válido con esta estructura exacta: ' +
-                '{"cards":[{"name":"","set":"","collector_number":"","confidence":0.0}]}. ' +
-                'Si no estás seguro del set o número, déjalos vacíos. ' +
-                'No escribas texto fuera del JSON.'
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${imageBase64}`
-              }
-            }
-          ]
-        }
-      ],
-      max_tokens: 900
-    }),
+    body: JSON.stringify(body)
   });
 
-  const json = await openaiRes.json();
-  const raw = json?.choices?.[0]?.message?.content || "";
+  const rawText = await openaiRes.text();
 
-  return raw;
+  if (!openaiRes.ok) {
+    throw new Error(`openai_http_${openaiRes.status}: ${rawText}`);
+  }
+
+  const json = safeJsonParse(rawText);
+  if (!json) {
+    throw new Error(`openai_non_json_response: ${rawText}`);
+  }
+
+  const content = json?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error(`openai_no_content: ${rawText}`);
+  }
+
+  return content;
 }
 
 function parseDetectedCards(rawText) {
   const cleaned = extractJsonBlock(rawText);
 
-  // intento 1: JSON directo
   let parsed = safeJsonParse(cleaned);
+
   if (parsed && Array.isArray(parsed.cards)) {
     return parsed.cards
       .map((c) => ({
@@ -186,13 +217,11 @@ function parseDetectedCards(rawText) {
         confidence:
           typeof c?.confidence === "number"
             ? c.confidence
-            : Number(c?.confidence || 0),
+            : Number(c?.confidence || 0)
       }))
       .filter((c) => c.name);
   }
 
-  // intento 2: si viene un array directo
-  parsed = safeJsonParse(cleaned);
   if (Array.isArray(parsed)) {
     return parsed
       .map((c) => ({
@@ -202,30 +231,39 @@ function parseDetectedCards(rawText) {
         confidence:
           typeof c?.confidence === "number"
             ? c.confidence
-            : Number(c?.confidence || 0),
+            : Number(c?.confidence || 0)
       }))
       .filter((c) => c.name);
   }
 
-  // intento 3: fallback muy simple para rescatar nombres
-  const possibleLines = cleaned
+  const lines = cleaned
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
-    .filter((l) => !l.startsWith("{") && !l.startsWith("}") && !l.startsWith("[") && !l.startsWith("]"));
+    .filter(
+      (l) =>
+        !l.startsWith("{") &&
+        !l.startsWith("}") &&
+        !l.startsWith("[") &&
+        !l.startsWith("]")
+    );
 
-  return possibleLines.slice(0, 9).map((line) => ({
+  return lines.slice(0, 9).map((line) => ({
     name: line.replace(/^[-•\d.\s]+/, "").trim(),
     set: "",
     collector_number: "",
-    confidence: 0.4,
+    confidence: 0.4
   })).filter((c) => c.name);
 }
 
 /* ---------------- RUTAS ---------------- */
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    hasOpenAIKey: Boolean(OPENAI_API_KEY),
+    hasPokemonKey: Boolean(POKEMON_API_KEY)
+  });
 });
 
 app.post("/api/scan", async (req, res) => {
@@ -236,15 +274,15 @@ app.post("/api/scan", async (req, res) => {
       return res.status(400).json({ error: "missing_image" });
     }
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "missing_openai_key" });
-    }
-
     const rawText = await detectCardsWithOpenAI(imageBase64);
     const cards = parseDetectedCards(rawText);
 
     if (!cards.length) {
-      return res.json({ cards: [] });
+      return res.json({
+        cards: [],
+        warning: "no_cards_detected",
+        raw: rawText
+      });
     }
 
     const result = [];
@@ -263,14 +301,18 @@ app.post("/api/scan", async (req, res) => {
             : 0.5,
         image_url: img,
         price_usd: prices.usd,
-        price_eur: prices.eur,
+        price_eur: prices.eur
       });
     }
 
-    res.json({ cards: result });
+    return res.json({ cards: result });
   } catch (err) {
-    console.error("SCAN ERROR:", err);
-    res.status(500).json({ error: "scan_failed" });
+    console.error("SCAN ERROR FULL:", err);
+
+    return res.status(500).json({
+      error: "scan_failed",
+      detail: String(err?.message || err)
+    });
   }
 });
 
