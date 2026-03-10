@@ -37,6 +37,13 @@ function normalizeNameForMatch(name) {
     .trim();
 }
 
+function normalizeSetForMatch(setValue) {
+  return String(setValue || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
+}
+
 function safeJsonParse(text) {
   try {
     return JSON.parse(text);
@@ -71,43 +78,66 @@ async function pokemonFetch(url) {
   return res.json();
 }
 
-async function findImageUrl(name, collector_number) {
+async function findImageUrl(name, setValue, collector_number) {
   try {
     const cleanName = String(name || "").replace(/"/g, "").trim();
+    const cleanSet = String(setValue || "").trim();
     const n = normNum(collector_number);
 
     if (!cleanName) return PLACEHOLDER_IMG;
 
     const wantedName = normalizeNameForMatch(cleanName);
+    const wantedSet = normalizeSetForMatch(cleanSet);
 
-    if (n) {
-      const q1 = `name:"${cleanName}" number:"${n}"`;
-      const d1 = await pokemonFetch(`/cards?q=${encodeURIComponent(q1)}&pageSize=10`);
-      const list1 = Array.isArray(d1?.data) ? d1.data : [];
+    const q = `name:"${cleanName}"`;
+    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=30`);
+    const list = Array.isArray(data?.data) ? data.data : [];
 
-      const exact1 = list1.find(
-        (card) =>
-          normalizeNameForMatch(card?.name) === wantedName &&
-          String(card?.number || "") === String(n)
-      );
+    // 1) Match exacto: nombre + set + número
+    const exact = list.find((card) => {
+      const apiName = normalizeNameForMatch(card?.name);
+      const apiSetId = normalizeSetForMatch(card?.set?.id);
+      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
+      const apiSetName = normalizeSetForMatch(card?.set?.name);
+      const apiNumber = normNum(card?.number);
 
-      if (exact1?.images?.small || exact1?.images?.large) {
-        return exact1.images.small || exact1.images.large;
-      }
+      const sameName = apiName === wantedName;
+      const sameSet =
+        !wantedSet ||
+        apiSetId === wantedSet ||
+        apiSetCode === wantedSet ||
+        apiSetName === wantedSet;
+      const sameNumber = !n || apiNumber === n;
+
+      return sameName && sameSet && sameNumber;
+    });
+
+    if (exact?.images?.small || exact?.images?.large) {
+      return exact.images.small || exact.images.large;
     }
 
-    const q2 = `name:"${cleanName}"`;
-    const d2 = await pokemonFetch(`/cards?q=${encodeURIComponent(q2)}&pageSize=10`);
-    const list2 = Array.isArray(d2?.data) ? d2.data : [];
+    // 2) Match exacto: nombre + set
+    const exactSet = list.find((card) => {
+      const apiName = normalizeNameForMatch(card?.name);
+      const apiSetId = normalizeSetForMatch(card?.set?.id);
+      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
+      const apiSetName = normalizeSetForMatch(card?.set?.name);
 
-    const exact2 = list2.find(
-      (card) => normalizeNameForMatch(card?.name) === wantedName
-    );
+      const sameName = apiName === wantedName;
+      const sameSet =
+        !wantedSet ||
+        apiSetId === wantedSet ||
+        apiSetCode === wantedSet ||
+        apiSetName === wantedSet;
 
-    if (exact2?.images?.small || exact2?.images?.large) {
-      return exact2.images.small || exact2.images.large;
+      return sameName && sameSet;
+    });
+
+    if (exactSet?.images?.small || exactSet?.images?.large) {
+      return exactSet.images.small || exactSet.images.large;
     }
 
+    // 3) Si no hay match real, mejor placeholder
     return PLACEHOLDER_IMG;
   } catch (err) {
     console.error("findImageUrl error:", err);
@@ -248,12 +278,15 @@ function parseDetectedCards(rawText) {
         !l.startsWith("]")
     );
 
-  return lines.slice(0, 9).map((line) => ({
-    name: line.replace(/^[-•\d.\s]+/, "").trim(),
-    set: "",
-    collector_number: "",
-    confidence: 0.4
-  })).filter((c) => c.name);
+  return lines
+    .slice(0, 9)
+    .map((line) => ({
+      name: line.replace(/^[-•\d.\s]+/, "").trim(),
+      set: "",
+      collector_number: "",
+      confidence: 0.4
+    }))
+    .filter((c) => c.name);
 }
 
 /* ---------------- RUTAS ---------------- */
@@ -288,7 +321,7 @@ app.post("/api/scan", async (req, res) => {
     const result = [];
 
     for (const card of cards) {
-      const img = await findImageUrl(card.name, card.collector_number);
+      const img = await findImageUrl(card.name, card.set, card.collector_number);
       const prices = await findPrices(card.name);
 
       result.push({
