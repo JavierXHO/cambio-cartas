@@ -20,10 +20,11 @@ const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/1.png";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const CARDS_FILE = path.join(DATA_DIR, "cards.json");
+const MESSAGES_FILE = path.join(DATA_DIR, "messages.json");
 
 /* ---------------- ARCHIVOS ---------------- */
 
-function ensureDataFile() {
+function ensureDataFiles() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
@@ -31,13 +32,17 @@ function ensureDataFile() {
   if (!fs.existsSync(CARDS_FILE)) {
     fs.writeFileSync(CARDS_FILE, "[]", "utf8");
   }
+
+  if (!fs.existsSync(MESSAGES_FILE)) {
+    fs.writeFileSync(MESSAGES_FILE, "[]", "utf8");
+  }
 }
 
-function readCardsFile() {
-  ensureDataFile();
+function readJsonArray(filePath) {
+  ensureDataFiles();
 
   try {
-    const raw = fs.readFileSync(CARDS_FILE, "utf8");
+    const raw = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -45,9 +50,25 @@ function readCardsFile() {
   }
 }
 
+function writeJsonArray(filePath, items) {
+  ensureDataFiles();
+  fs.writeFileSync(filePath, JSON.stringify(items, null, 2), "utf8");
+}
+
+function readCardsFile() {
+  return readJsonArray(CARDS_FILE);
+}
+
 function writeCardsFile(cards) {
-  ensureDataFile();
-  fs.writeFileSync(CARDS_FILE, JSON.stringify(cards, null, 2), "utf8");
+  writeJsonArray(CARDS_FILE, cards);
+}
+
+function readMessagesFile() {
+  return readJsonArray(MESSAGES_FILE);
+}
+
+function writeMessagesFile(messages) {
+  writeJsonArray(MESSAGES_FILE, messages);
 }
 
 /* ---------------- UTILIDADES ---------------- */
@@ -93,10 +114,7 @@ function extractJsonBlock(text) {
 }
 
 function makeId() {
-  return (
-    Date.now().toString(36) +
-    Math.random().toString(36).slice(2, 8)
-  );
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 /* ---------------- POKEMON API ---------------- */
@@ -410,6 +428,64 @@ app.post("/api/publish", (req, res) => {
   }
 });
 
+app.get("/api/interes", (req, res) => {
+  try {
+    const messages = readMessagesFile().sort(
+      (a, b) => new Date(b.created_at) - new Date(a.created_at)
+    );
+
+    return res.json({ messages });
+  } catch (err) {
+    console.error("GET /api/interes error:", err);
+    return res.status(500).json({ error: "messages_read_failed" });
+  }
+});
+
+app.post("/api/interes", (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      message,
+      card_id,
+      card_name,
+      card_set,
+      card_number
+    } = req.body;
+
+    if (!name || !email || !message || !card_name) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+
+    const currentMessages = readMessagesFile();
+
+    const newMessage = {
+      id: makeId(),
+      name: String(name).trim(),
+      email: String(email).trim(),
+      message: String(message).trim(),
+      card_id: String(card_id || "").trim(),
+      card_name: String(card_name || "").trim(),
+      card_set: String(card_set || "").trim(),
+      card_number: String(card_number || "").trim(),
+      created_at: new Date().toISOString(),
+      status: "new"
+    };
+
+    currentMessages.push(newMessage);
+    writeMessagesFile(currentMessages);
+
+    return res.json({
+      ok: true,
+      saved: true,
+      message: newMessage
+    });
+  } catch (err) {
+    console.error("POST /api/interes error:", err);
+    return res.status(500).json({ error: "interest_save_failed" });
+  }
+});
+
 app.post("/api/scan", async (req, res) => {
   try {
     const { imageBase64 } = req.body;
@@ -462,7 +538,7 @@ app.post("/api/scan", async (req, res) => {
 
 /* ---------------- SERVER ---------------- */
 
-ensureDataFile();
+ensureDataFiles();
 
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
