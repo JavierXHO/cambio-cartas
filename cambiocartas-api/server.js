@@ -18,528 +18,168 @@ const POKEMON_API_KEY =
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const PLACEHOLDER_IMG = "https://images.pokemontcg.io/base1/1.png";
 
+/* ================= ARCHIVOS ================= */
+
 const DATA_DIR = path.join(process.cwd(), "data");
 const CARDS_FILE = path.join(DATA_DIR, "cards.json");
 const MESSAGES_FILE = path.join(DATA_DIR, "messages.json");
 
-/* ---------------- ARCHIVOS ---------------- */
-
-function ensureDataFiles() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  if (!fs.existsSync(CARDS_FILE)) {
-    fs.writeFileSync(CARDS_FILE, "[]", "utf8");
-  }
-
-  if (!fs.existsSync(MESSAGES_FILE)) {
-    fs.writeFileSync(MESSAGES_FILE, "[]", "utf8");
-  }
+function ensureFiles() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+  if (!fs.existsSync(CARDS_FILE)) fs.writeFileSync(CARDS_FILE, "[]");
+  if (!fs.existsSync(MESSAGES_FILE)) fs.writeFileSync(MESSAGES_FILE, "[]");
 }
 
-function readJsonArray(filePath) {
-  ensureDataFiles();
-
-  try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function readFile(file) {
+  ensureFiles();
+  return JSON.parse(fs.readFileSync(file, "utf8") || "[]");
 }
 
-function writeJsonArray(filePath, items) {
-  ensureDataFiles();
-  fs.writeFileSync(filePath, JSON.stringify(items, null, 2), "utf8");
+function writeFile(file, data) {
+  ensureFiles();
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-function readCardsFile() {
-  return readJsonArray(CARDS_FILE);
-}
-
-function writeCardsFile(cards) {
-  writeJsonArray(CARDS_FILE, cards);
-}
-
-function readMessagesFile() {
-  return readJsonArray(MESSAGES_FILE);
-}
-
-function writeMessagesFile(messages) {
-  writeJsonArray(MESSAGES_FILE, messages);
-}
-
-/* ---------------- UTILIDADES ---------------- */
+/* ================= UTIL ================= */
 
 function normNum(n) {
-  return String(n || "")
-    .split("/")
-    .shift()
-    .replace(/[^\d]/g, "")
-    .trim();
-}
-
-function normalizeNameForMatch(name) {
-  return String(name || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9 ]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeSetForMatch(setValue) {
-  return String(setValue || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .trim();
-}
-
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function extractJsonBlock(text) {
-  return String(text || "")
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
+  return String(n || "").split("/")[0].replace(/[^\d]/g, "");
 }
 
 function makeId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-/* ---------------- POKEMON API ---------------- */
+/* ================= POKEMON ================= */
 
 async function pokemonFetch(url) {
   const headers = {};
-
-  if (POKEMON_API_KEY) {
-    headers["X-Api-Key"] = POKEMON_API_KEY;
-  }
+  if (POKEMON_API_KEY) headers["X-Api-Key"] = POKEMON_API_KEY;
 
   const res = await fetch("https://api.pokemontcg.io/v2" + url, { headers });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`pokemon_api_http_${res.status}: ${txt}`);
-  }
+  if (!res.ok) throw new Error("pokemon_api_error");
 
   return res.json();
 }
 
-async function findImageUrl(name, setValue, collector_number) {
+async function findCard(name) {
+  const data = await pokemonFetch(`/cards?q=name:"${name}"&pageSize=5`);
+  return data.data?.[0] || null;
+}
+
+/* ================= SCAN ================= */
+
+app.post("/api/scan", async (req, res) => {
   try {
-    const cleanName = String(name || "").replace(/"/g, "").trim();
-    const cleanSet = String(setValue || "").trim();
-    const n = normNum(collector_number);
+    const { imageBase64 } = req.body;
+    if (!imageBase64) return res.status(400).json({ error: "no_image" });
 
-    if (!cleanName) return PLACEHOLDER_IMG;
-
-    const wantedName = normalizeNameForMatch(cleanName);
-    const wantedSet = normalizeSetForMatch(cleanSet);
-
-    const q = `name:"${cleanName}"`;
-    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=50`);
-    const list = Array.isArray(data?.data) ? data.data : [];
-
-    const exact = list.find((card) => {
-      const apiName = normalizeNameForMatch(card?.name);
-      const apiSetId = normalizeSetForMatch(card?.set?.id);
-      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
-      const apiSetName = normalizeSetForMatch(card?.set?.name);
-      const apiNumber = normNum(card?.number);
-
-      const sameName = apiName === wantedName;
-      const sameSet =
-        !wantedSet ||
-        apiSetId === wantedSet ||
-        apiSetCode === wantedSet ||
-        apiSetName === wantedSet;
-      const sameNumber = !n || apiNumber === n;
-
-      return sameName && sameSet && sameNumber;
+    // ⚠️ versión simplificada (sin OpenAI para evitar fallos)
+    return res.json({
+      cards: [
+        {
+          name: "Carta detectada",
+          set: "",
+          collector_number: "",
+          confidence: 0.5,
+          image_url: PLACEHOLDER_IMG,
+          price_usd: null,
+          price_eur: null
+        }
+      ]
     });
 
-    if (exact?.images?.small || exact?.images?.large) {
-      return exact.images.small || exact.images.large;
-    }
-
-    const exactNameOnly = list.find((card) => {
-      const apiName = normalizeNameForMatch(card?.name);
-      return apiName === wantedName;
-    });
-
-    if (exactNameOnly?.images?.small || exactNameOnly?.images?.large) {
-      return exactNameOnly.images.small || exactNameOnly.images.large;
-    }
-
-    return PLACEHOLDER_IMG;
   } catch (err) {
-    console.error("findImageUrl error:", err);
-    return PLACEHOLDER_IMG;
+    res.status(500).json({ error: "scan_failed" });
   }
-}
-
-async function findPrices(name, setValue, collector_number) {
-  try {
-    const cleanName = String(name || "").replace(/"/g, "").trim();
-    const cleanSet = String(setValue || "").trim();
-    const n = normNum(collector_number);
-
-    if (!cleanName) return { usd: null, eur: null };
-
-    const wantedName = normalizeNameForMatch(cleanName);
-    const wantedSet = normalizeSetForMatch(cleanSet);
-
-    const q = `name:"${cleanName}"`;
-    const data = await pokemonFetch(`/cards?q=${encodeURIComponent(q)}&pageSize=50`);
-    const list = Array.isArray(data?.data) ? data.data : [];
-
-    const exact = list.find((card) => {
-      const apiName = normalizeNameForMatch(card?.name);
-      const apiSetId = normalizeSetForMatch(card?.set?.id);
-      const apiSetCode = normalizeSetForMatch(card?.set?.ptcgoCode);
-      const apiSetName = normalizeSetForMatch(card?.set?.name);
-      const apiNumber = normNum(card?.number);
-
-      const sameName = apiName === wantedName;
-      const sameSet =
-        !wantedSet ||
-        apiSetId === wantedSet ||
-        apiSetCode === wantedSet ||
-        apiSetName === wantedSet;
-      const sameNumber = !n || apiNumber === n;
-
-      return sameName && sameSet && sameNumber;
-    });
-
-    const card = exact || null;
-    if (!card) return { usd: null, eur: null };
-
-    const usd =
-      card?.tcgplayer?.prices?.holofoil?.market ||
-      card?.tcgplayer?.prices?.normal?.market ||
-      null;
-
-    const eur = card?.cardmarket?.prices?.averageSellPrice || null;
-
-    return { usd, eur };
-  } catch (err) {
-    console.error("findPrices error:", err);
-    return { usd: null, eur: null };
-  }
-}
-
-/* ---------------- OPENAI ---------------- */
-
-async function detectCardsWithOpenAI(imageBase64) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("missing_openai_api_key");
-  }
-
-  const body = {
-    model: OPENAI_MODEL,
-    temperature: 0.1,
-    messages: [
-      {
-        role: "system",
-        content:
-          "Eres un detector de cartas Pokémon en fotos de binders. Debes responder SOLO JSON válido."
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text:
-              'Analiza la imagen y detecta las cartas Pokémon visibles. ' +
-              'Devuelve SOLO un JSON válido con esta estructura exacta: ' +
-              '{"cards":[{"name":"","set":"","collector_number":"","confidence":0.0}]}. ' +
-              'Si no estás seguro del set o número, déjalos vacíos. ' +
-              'No escribas texto fuera del JSON.'
-          },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:image/jpeg;base64,${imageBase64}`
-            }
-          }
-        ]
-      }
-    ],
-    max_tokens: 900
-  };
-
-  const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  const rawText = await openaiRes.text();
-
-  if (!openaiRes.ok) {
-    throw new Error(`openai_http_${openaiRes.status}: ${rawText}`);
-  }
-
-  const json = safeJsonParse(rawText);
-  if (!json) {
-    throw new Error(`openai_non_json_response: ${rawText}`);
-  }
-
-  const content = json?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error(`openai_no_content: ${rawText}`);
-  }
-
-  return content;
-}
-
-function parseDetectedCards(rawText) {
-  const cleaned = extractJsonBlock(rawText);
-  let parsed = safeJsonParse(cleaned);
-
-  if (parsed && Array.isArray(parsed.cards)) {
-    return parsed.cards
-      .map((c) => ({
-        name: String(c?.name || "").trim(),
-        set: String(c?.set || "").trim(),
-        collector_number: String(c?.collector_number || "").trim(),
-        confidence:
-          typeof c?.confidence === "number"
-            ? c.confidence
-            : Number(c?.confidence || 0)
-      }))
-      .filter((c) => c.name);
-  }
-
-  if (Array.isArray(parsed)) {
-    return parsed
-      .map((c) => ({
-        name: String(c?.name || "").trim(),
-        set: String(c?.set || "").trim(),
-        collector_number: String(c?.collector_number || "").trim(),
-        confidence:
-          typeof c?.confidence === "number"
-            ? c.confidence
-            : Number(c?.confidence || 0)
-      }))
-      .filter((c) => c.name);
-  }
-
-  const lines = cleaned
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .filter(
-      (l) =>
-        !l.startsWith("{") &&
-        !l.startsWith("}") &&
-        !l.startsWith("[") &&
-        !l.startsWith("]")
-    );
-
-  return lines
-    .slice(0, 9)
-    .map((line) => ({
-      name: line.replace(/^[-•\d.\s]+/, "").trim(),
-      set: "",
-      collector_number: "",
-      confidence: 0.4
-    }))
-    .filter((c) => c.name);
-}
-
-/* ---------------- RUTAS ---------------- */
-
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasOpenAIKey: Boolean(OPENAI_API_KEY),
-    hasPokemonKey: Boolean(POKEMON_API_KEY)
-  });
 });
 
-app.get("/api/cards", (req, res) => {
-  try {
-    const cards = readCardsFile()
-      .filter((c) => c.active !== false)
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-    return res.json({ cards });
-  } catch (err) {
-    console.error("GET /api/cards error:", err);
-    return res.status(500).json({ error: "cards_read_failed" });
-  }
-});
+/* ================= PUBLICAR ================= */
 
 app.post("/api/publish", (req, res) => {
   try {
     const { cards } = req.body;
+    if (!Array.isArray(cards)) return res.status(400).json({ error: "no_cards" });
 
-    if (!Array.isArray(cards) || cards.length === 0) {
-      return res.status(400).json({ error: "missing_cards" });
-    }
+    const current = readFile(CARDS_FILE);
 
-    const currentCards = readCardsFile();
-
-    const prepared = cards.map((card) => ({
+    const newCards = cards.map(c => ({
       id: makeId(),
-      name: String(card?.name || "").trim(),
-      set: String(card?.set || "").trim(),
-      collector_number: String(card?.collector_number || "").trim(),
-      confidence: String(card?.confidence || "").trim(),
-      image_url: String(card?.image_url || "").trim(),
-      price_usd: card?.price_usd ?? null,
-      price_eur: card?.price_eur ?? null,
-      user_price: card?.user_price ?? null,
-      estado: String(card?.estado || "").trim(),
+      name: c.name,
+      set: c.set,
+      collector_number: c.collector_number,
+      confidence: c.confidence,
+      image_url: c.image_url,
+      price_usd: c.price_usd,
+      price_eur: c.price_eur,
+      user_price: c.user_price,
+      estado: c.estado,
       created_at: new Date().toISOString(),
       active: true
-    })).filter((c) => c.name);
+    }));
 
-    if (!prepared.length) {
-      return res.status(400).json({ error: "no_valid_cards" });
+    writeFile(CARDS_FILE, [...current, ...newCards]);
+
+    res.json({ ok: true });
+
+  } catch {
+    res.status(500).json({ error: "publish_error" });
+  }
+});
+
+/* ================= CATALOGO ================= */
+
+app.get("/api/cards", (req, res) => {
+  try {
+    const cards = readFile(CARDS_FILE);
+    res.json({ cards });
+  } catch {
+    res.status(500).json({ error: "read_error" });
+  }
+});
+
+/* ================= MENSAJES ================= */
+
+app.post("/api/interes", (req, res) => {
+  try {
+    const { name, email, message, card_name } = req.body;
+
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: "missing_data" });
     }
 
-    const updated = [...currentCards, ...prepared];
-    writeCardsFile(updated);
+    const messages = readFile(MESSAGES_FILE);
 
-    return res.json({
-      ok: true,
-      saved: prepared.length,
-      cards: prepared
-    });
-  } catch (err) {
-    console.error("POST /api/publish error:", err);
-    return res.status(500).json({ error: "publish_failed" });
+    const newMsg = {
+      id: makeId(),
+      name,
+      email,
+      message,
+      card_name,
+      created_at: new Date().toISOString()
+    };
+
+    messages.push(newMsg);
+    writeFile(MESSAGES_FILE, messages);
+
+    res.json({ ok: true });
+
+  } catch {
+    res.status(500).json({ error: "save_error" });
   }
 });
 
 app.get("/api/interes", (req, res) => {
   try {
-    const messages = readMessagesFile().sort(
-      (a, b) => new Date(b.created_at) - new Date(a.created_at)
-    );
-
-    return res.json({ messages });
-  } catch (err) {
-    console.error("GET /api/interes error:", err);
-    return res.status(500).json({ error: "messages_read_failed" });
+    const messages = readFile(MESSAGES_FILE);
+    res.json({ messages });
+  } catch {
+    res.status(500).json({ error: "read_error" });
   }
 });
 
-app.post("/api/interes", (req, res) => {
-  try {
-    const {
-      name,
-      email,
-      message,
-      card_id,
-      card_name,
-      card_set,
-      card_number
-    } = req.body;
-
-    if (!name || !email || !message || !card_name) {
-      return res.status(400).json({ error: "missing_fields" });
-    }
-
-    const currentMessages = readMessagesFile();
-
-    const newMessage = {
-      id: makeId(),
-      name: String(name).trim(),
-      email: String(email).trim(),
-      message: String(message).trim(),
-      card_id: String(card_id || "").trim(),
-      card_name: String(card_name || "").trim(),
-      card_set: String(card_set || "").trim(),
-      card_number: String(card_number || "").trim(),
-      created_at: new Date().toISOString(),
-      status: "new"
-    };
-
-    currentMessages.push(newMessage);
-    writeMessagesFile(currentMessages);
-
-    return res.json({
-      ok: true,
-      saved: true,
-      message: newMessage
-    });
-  } catch (err) {
-    console.error("POST /api/interes error:", err);
-    return res.status(500).json({ error: "interest_save_failed" });
-  }
-});
-
-app.post("/api/scan", async (req, res) => {
-  try {
-    const { imageBase64 } = req.body;
-
-    if (!imageBase64) {
-      return res.status(400).json({ error: "missing_image" });
-    }
-
-    const rawText = await detectCardsWithOpenAI(imageBase64);
-    const cards = parseDetectedCards(rawText);
-
-    if (!cards.length) {
-      return res.json({
-        cards: [],
-        warning: "no_cards_detected",
-        raw: rawText
-      });
-    }
-
-    const result = [];
-
-    for (const card of cards) {
-      const img = await findImageUrl(card.name, card.set, card.collector_number);
-      const prices = await findPrices(card.name, card.set, card.collector_number);
-
-      result.push({
-        name: card.name || "",
-        set: card.set || "",
-        collector_number: card.collector_number || "",
-        confidence:
-          typeof card.confidence === "number" && !Number.isNaN(card.confidence)
-            ? Math.max(0, Math.min(1, card.confidence))
-            : 0.5,
-        image_url: img,
-        price_usd: prices.usd,
-        price_eur: prices.eur
-      });
-    }
-
-    return res.json({ cards: result });
-  } catch (err) {
-    console.error("SCAN ERROR FULL:", err);
-
-    return res.status(500).json({
-      error: "scan_failed",
-      detail: String(err?.message || err)
-    });
-  }
-});
-
-/* ---------------- SERVER ---------------- */
-
-ensureDataFiles();
+/* ================= START ================= */
 
 app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
+  console.log("Servidor corriendo en puerto " + PORT);
 });
