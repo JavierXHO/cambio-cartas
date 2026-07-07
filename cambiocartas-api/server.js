@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { GoogleGenAI } from "@google/genai";
 
 const app = express();
 
@@ -8,15 +9,23 @@ app.use(express.json({ limit: "30mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const POKEMON_API_KEY =
-  process.env.POKEMON_API_KEY ||
   process.env.POKEMONTCG_API_KEY ||
+  process.env.POKEMON_API_KEY ||
   "";
 
 const POKEMON_API_BASE = "https://api.pokemontcg.io/v2";
+
+if (!GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY no está configurada");
+}
+
+const ai = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY
+});
 
 function cleanText(text) {
   return String(text || "").trim();
@@ -41,36 +50,35 @@ function normalizeCardNumber(value) {
     .replace(/[^\d]/g, "");
 }
 
-function getOutputText(data) {
-  if (data.output_text) return data.output_text;
-
-  let text = "";
-
-  if (Array.isArray(data.output)) {
-    for (const item of data.output) {
-      if (Array.isArray(item.content)) {
-        for (const content of item.content) {
-          if (content.text) text += content.text;
-          if (content.type === "output_text" && content.text) text += content.text;
-        }
-      }
-    }
-  }
-
-  return text;
+function escapePokemonQuery(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .trim();
 }
 
-async function analyzeImageWithOpenAI(imageBase64) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY no configurada");
+function getMimeTypeFromBase64(base64) {
+  if (base64.startsWith("/9j/")) return "image/jpeg";
+  if (base64.startsWith("iVBOR")) return "image/png";
+  if (base64.startsWith("UklGR")) return "image/webp";
+  return "image/jpeg";
+}
+
+async function analyzeImageWithGemini(imageBase64) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY no configurada");
   }
+
+  const mimeType = getMimeTypeFromBase64(imageBase64);
 
   const prompt = `
 Analiza esta imagen de cartas Pokémon TCG.
 
-Necesito que detectes todas las cartas visibles. Si es una sola carta, devuelve una sola.
+Detecta todas las cartas visibles. Si es una sola carta, devuelve una sola.
 
-Devuelve SOLO JSON válido, sin markdown, con esta estructura:
+Devuelve SOLO JSON válido, sin markdown, sin texto adicional.
+
+Estructura obligatoria:
 
 {
   "cards": [
@@ -85,55 +93,39 @@ Devuelve SOLO JSON válido, sin markdown, con esta estructura:
 
 Reglas:
 - No inventes cartas si no estás razonablemente seguro.
-- Si el nombre no se ve completo, usa la mejor estimación.
-- confidence debe ir entre 0 y 1.
 - Si no detectas cartas, devuelve {"cards":[]}
+- confidence debe estar entre 0 y 1.
+- Si ves el número tipo "4/102", collector_number debe ser "4".
+- Si el set no se ve claro, deja set vacío.
 `;
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: prompt
-            },
-            {
-              type: "input_image",
-              image_url: `data:image/jpeg;base64,${imageBase64}`,
-              detail: "high"
-            }
-          ]
+  const result = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [
+      {
+        text: prompt
+      },
+      {
+        inlineData: {
+          mimeType,
+          data: imageBase64
         }
-      ],
-      max_output_tokens: 1800
-    })
+      }
+    ]
   });
 
-  const data = await response.json();
+  const text = cleanJsonText(result.text || "");
 
-  if (!response.ok) {
-    console.error("OpenAI error:", data);
-    throw new Error(data?.error?.message || "openai_error");
-  }
-
-  const outputText = cleanJsonText(getOutputText(data));
+  let parsed;
 
   try {
-    const parsed = JSON.parse(outputText);
-    return Array.isArray(parsed.cards) ? parsed.cards : [];
-  } catch (err) {
-    console.error("No se pudo parsear JSON OpenAI:", outputText);
-    throw new Error("openai_invalid_json");
+    parsed = JSON.parse(text);
+  } catch (error) {
+    console.error("Gemini devolvió JSON inválido:", text);
+    throw new Error("gemini_invalid_json");
   }
+
+  return Array.isArray(parsed.cards) ? parsed.cards : [];
 }
 
 async function pokemonFetch(path) {
@@ -143,7 +135,9 @@ async function pokemonFetch(path) {
     headers["X-Api-Key"] = POKEMON_API_KEY;
   }
 
-  const response = await fetch(POKEMON_API_BASE + path, { headers });
+  const response = await fetch(POKEMON_API_BASE + path, {
+    headers
+  });
 
   if (!response.ok) {
     const text = await response.text();
@@ -152,13 +146,6 @@ async function pokemonFetch(path) {
   }
 
   return response.json();
-}
-
-function escapePokemonQuery(value) {
-  return String(value || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .trim();
 }
 
 function getUsdPrice(card) {
@@ -174,12 +161,12 @@ function getUsdPrice(card) {
     prices.unlimitedHolofoil
   ].filter(Boolean);
 
-  for (const p of possible) {
+  for (const price of possible) {
     const value =
-      p.market ??
-      p.mid ??
-      p.low ??
-      p.high ??
+      price.market ??
+      price.mid ??
+      price.low ??
+      price.high ??
       null;
 
     if (value !== null && value !== undefined) {
@@ -264,7 +251,9 @@ async function findBestPokemonCard(detected) {
 
   if (!candidates.length) return null;
 
-  candidates.sort((a, b) => scorePokemonCard(b, detected) - scorePokemonCard(a, detected));
+  candidates.sort((a, b) => {
+    return scorePokemonCard(b, detected) - scorePokemonCard(a, detected);
+  });
 
   return candidates[0];
 }
@@ -288,7 +277,8 @@ async function enrichDetectedCard(card) {
       image_url: "",
       price_usd: null,
       price_eur: null,
-      match_source: "openai_only"
+      pokemon_id: null,
+      match_source: "gemini_only"
     };
   }
 
@@ -309,6 +299,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     app: "CambioCartas API",
+    engine: "Gemini + PokemonTCG",
     endpoints: ["/api/health", "/api/scan", "/api/search-card"]
   });
 });
@@ -317,7 +308,8 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     service: "CambioCartas API",
-    openai: Boolean(OPENAI_API_KEY),
+    gemini: Boolean(GEMINI_API_KEY),
+    gemini_model: GEMINI_MODEL,
     pokemon_api_key: Boolean(POKEMON_API_KEY)
   });
 });
@@ -327,13 +319,17 @@ app.post("/api/scan", async (req, res) => {
     const { imageBase64 } = req.body;
 
     if (!imageBase64) {
-      return res.status(400).json({ error: "no_image" });
+      return res.status(400).json({
+        error: "no_image"
+      });
     }
 
-    const detected = await analyzeImageWithOpenAI(imageBase64);
+    const detected = await analyzeImageWithGemini(imageBase64);
 
     if (!detected.length) {
-      return res.json({ cards: [] });
+      return res.json({
+        cards: []
+      });
     }
 
     const enriched = [];
@@ -342,8 +338,9 @@ app.post("/api/scan", async (req, res) => {
       try {
         const result = await enrichDetectedCard(card);
         enriched.push(result);
-      } catch (err) {
-        console.error("Error enriqueciendo carta:", err);
+      } catch (error) {
+        console.error("Error enriqueciendo carta:", error);
+
         enriched.push({
           name: card.name || "Carta no identificada",
           set: card.set || "",
@@ -352,18 +349,22 @@ app.post("/api/scan", async (req, res) => {
           image_url: "",
           price_usd: null,
           price_eur: null,
+          pokemon_id: null,
           match_source: "fallback"
         });
       }
     }
 
-    res.json({ cards: enriched });
+    return res.json({
+      cards: enriched
+    });
 
-  } catch (err) {
-    console.error("POST /api/scan error:", err);
-    res.status(500).json({
+  } catch (error) {
+    console.error("POST /api/scan error:", error);
+
+    return res.status(500).json({
       error: "scan_failed",
-      detail: err.message
+      detail: error.message
     });
   }
 });
@@ -375,7 +376,9 @@ app.get("/api/search-card", async (req, res) => {
     const collector_number = cleanText(req.query.number);
 
     if (!name) {
-      return res.status(400).json({ error: "missing_name" });
+      return res.status(400).json({
+        error: "missing_name"
+      });
     }
 
     const result = await enrichDetectedCard({
@@ -385,17 +388,20 @@ app.get("/api/search-card", async (req, res) => {
       confidence: 1
     });
 
-    res.json({ card: result });
+    return res.json({
+      card: result
+    });
 
-  } catch (err) {
-    console.error("GET /api/search-card error:", err);
-    res.status(500).json({
+  } catch (error) {
+    console.error("GET /api/search-card error:", error);
+
+    return res.status(500).json({
       error: "search_failed",
-      detail: err.message
+      detail: error.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`CambioCartas API corriendo en puerto ${PORT}`);
+  console.log(`CambioCartas API con Gemini corriendo en puerto ${PORT}`);
 });
